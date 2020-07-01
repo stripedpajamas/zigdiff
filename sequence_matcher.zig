@@ -1,21 +1,27 @@
 const std = @import("std");
 const mem = std.mem;
-const unicode = std.unicode;
+const assert = std.debug.assert;
 const ArrayList = std.ArrayList;
 const AutoHashMap = std.AutoHashMap;
+
+pub const LongestMatch = struct {
+    a_idx: usize,
+    b_idx: usize,
+    size: usize,
+};
 
 pub const SequenceMatcher = struct {
     seq1: []const u8,
     seq2: []const u8,
     allocator: *mem.Allocator,
 
-    b2j: AutoHashMap(u21, ArrayList(usize)),
+    b2j: AutoHashMap(u8, ArrayList(usize)),
     matching_blocks: []i32, 
     opcodes: []i32,
     full_b_count: []i32,
 
     pub fn init(allocator: *mem.Allocator, a: []const u8, b: []const u8) !SequenceMatcher {
-        var b2j = AutoHashMap(u21, ArrayList(usize)).init(allocator);
+        var b2j = AutoHashMap(u8, ArrayList(usize)).init(allocator);
         var sm = SequenceMatcher{
             .allocator = allocator,
             .seq1 = undefined,
@@ -67,135 +73,97 @@ pub const SequenceMatcher = struct {
     fn chainB(self: *SequenceMatcher) !void {
         var b = self.seq2;
         self.b2j.clear();
-        var b2f = self.b2j;
 
         var n_test = @intToFloat(f32, b.len) / 100 + 1;
 
-        var idx: usize = 0;
-        var utf8 = (try unicode.Utf8View.init(b)).iterator();
-        while (utf8.nextCodepoint()) |codepoint| {
-            if (self.b2j.getValue(codepoint)) |*codepoint_idxs| {
-                var codepoint_size = @intToFloat(f32, codepoint_idxs.items.len);
-                if (b.len >= 200 and codepoint_size > n_test) {
-                    continue;
-                }
-                try codepoint_idxs.append(idx);
+        for (b) |byte, idx| {
+            if (self.b2j.getValue(byte)) |*byte_idxs| {
+                var byte_idx_size = @intToFloat(f32, byte_idxs.items.len);
+                if (b.len >= 200 and byte_idx_size > n_test) continue;
+                try byte_idxs.append(idx);
+                _ = try self.b2j.put(byte, byte_idxs.*);
             } else {
-                var codepoint_idxs = ArrayList(usize).init(self.allocator);
-                try codepoint_idxs.append(codepoint);
-                _ = try self.b2j.put(codepoint, codepoint_idxs);
+                var byte_idxs = ArrayList(usize).init(self.allocator);
+                try byte_idxs.append(idx);
+                _ = try self.b2j.put(byte, byte_idxs);
             }
         }
+    }
 
+    fn findLongestMatch(self: *SequenceMatcher, a_lo: usize, a_hi: usize, b_lo: usize, b_hi: usize) !LongestMatch {
+        var a = self.seq1;
+        var b = self.seq2;
+        assert(a_hi <= a.len and b_hi <= b.len);
+
+        var b2j = self.b2j;
+        var best_i = a_lo;
+        var best_j = b_lo;
+        var best_size: usize = 0;
+        var j2_len = AutoHashMap(usize, usize).init(self.allocator);
+        var nothing = [0]usize{};
+
+        var i = a_lo;
+        while (i < a_hi) : (i += 1) {
+            var indices: []usize = undefined;
+            if (b2j.getValue(a[i])) |value| {
+                indices = value.items;
+            } else {
+                indices = &nothing;
+            }
+
+            var next_j2_len: AutoHashMap(usize, usize) = undefined;
+            var updated_j2_len = false;
+            for (indices) |j| {
+                if (j < b_lo) continue;
+                if (j >= b_hi) break;
+                var k = (if (j == 0) 0 else (j2_len.getValue(j - 1) orelse 0)) + 1;
+
+                if (!updated_j2_len) {
+                    next_j2_len = AutoHashMap(usize, usize).init(self.allocator);
+                    updated_j2_len = true;
+                }
+                _ = try next_j2_len.put(j, k);
+                if (k > best_size) {
+                    best_i = i + 1 - k;
+                    best_j = j + 1 - k;
+                    best_size = k;
+                }
+            }
+            if (updated_j2_len) {
+                j2_len.deinit();
+                j2_len = next_j2_len;
+            }
+        }
+        j2_len.deinit();
+
+        while (best_i > a_lo and best_j > b_lo and a[best_i - 1] == b[best_j - 1]) {
+            best_i -= 1;
+            best_j -= 1;
+            best_size += 1;
+        }
+
+        while (best_i + best_size < a_hi and best_j + best_size < b_hi and a[best_i + best_size] == b[best_j + best_size]) {
+            best_size += 1;
+        }
+
+        return LongestMatch{
+            .a_idx = best_i,
+            .b_idx = best_j,
+            .size = best_size,
+        };
     }
 };
 
-test "sequence matcher" {
+test "sequence matcher - find longest match" {
     const allocator = std.testing.allocator;
-    var sm = try SequenceMatcher.init(allocator, "abcd", "bcde");
+    // var sm = try SequenceMatcher.init(allocator, "abcd", "bcde");
+    var sm = try SequenceMatcher.init(allocator, " abcd", "abcd abcd");
     defer sm.deinit();
+    var lm = try sm.findLongestMatch(0, 5, 0, 9);
+    assert(lm.a_idx == 0);
+    assert(lm.b_idx == 4);
+    assert(lm.size == 5);
 }
-
-//     def find_longest_match(self, alo, ahi, blo, bhi):
-//         """Find longest matching block in a[alo:ahi] and b[blo:bhi].
-//         If isjunk is not defined:
-//         Return (i,j,k) such that a[i:i+k] is equal to b[j:j+k], where
-//             alo <= i <= i+k <= ahi
-//             blo <= j <= j+k <= bhi
-//         and for all (i',j',k') meeting those conditions,
-//             k >= k'
-//             i <= i'
-//             and if i == i', j <= j'
-//         In other words, of all maximal matching blocks, return one that
-//         starts earliest in a, and of all those maximal matching blocks that
-//         start earliest in a, return the one that starts earliest in b.
-//         >>> s = SequenceMatcher(None, " abcd", "abcd abcd")
-//         >>> s.find_longest_match(0, 5, 0, 9)
-//         Match(a=0, b=4, size=5)
-//         If isjunk is defined, first the longest matching block is
-//         determined as above, but with the additional restriction that no
-//         junk element appears in the block.  Then that block is extended as
-//         far as possible by matching (only) junk elements on both sides.  So
-//         the resulting block never matches on junk except as identical junk
-//         happens to be adjacent to an "interesting" match.
-//         Here's the same example as before, but considering blanks to be
-//         junk.  That prevents " abcd" from matching the " abcd" at the tail
-//         end of the second sequence directly.  Instead only the "abcd" can
-//         match, and matches the leftmost "abcd" in the second sequence:
-//         >>> s = SequenceMatcher(lambda x: x==" ", " abcd", "abcd abcd")
-//         >>> s.find_longest_match(0, 5, 0, 9)
-//         Match(a=1, b=0, size=4)
-//         If no blocks match, return (alo, blo, 0).
-//         >>> s = SequenceMatcher(None, "ab", "c")
-//         >>> s.find_longest_match(0, 2, 0, 1)
-//         Match(a=0, b=0, size=0)
-//         """
-
-//         # CAUTION:  stripping common prefix or suffix would be incorrect.
-//         # E.g.,
-//         #    ab
-//         #    acab
-//         # Longest matching block is "ab", but if common prefix is
-//         # stripped, it's "a" (tied with "b").  UNIX(tm) diff does so
-//         # strip, so ends up claiming that ab is changed to acab by
-//         # inserting "ca" in the middle.  That's minimal but unintuitive:
-//         # "it's obvious" that someone inserted "ac" at the front.
-//         # Windiff ends up at the same place as diff, but by pairing up
-//         # the unique 'b's and then matching the first two 'a's.
-
-//         a, b, b2j, isbjunk = self.a, self.b, self.b2j, self.bjunk.__contains__
-//         besti, bestj, bestsize = alo, blo, 0
-//         # find longest junk-free match
-//         # during an iteration of the loop, j2len[j] = length of longest
-//         # junk-free match ending with a[i-1] and b[j]
-//         j2len = {}
-//         nothing = []
-//         for i in range(alo, ahi):
-//             # look at all instances of a[i] in b; note that because
-//             # b2j has no junk keys, the loop is skipped if a[i] is junk
-//             j2lenget = j2len.get
-//             newj2len = {}
-//             for j in b2j.get(a[i], nothing):
-//                 # a[i] matches b[j]
-//                 if j < blo:
-//                     continue
-//                 if j >= bhi:
-//                     break
-//                 k = newj2len[j] = j2lenget(j-1, 0) + 1
-//                 if k > bestsize:
-//                     besti, bestj, bestsize = i-k+1, j-k+1, k
-//             j2len = newj2len
-
-//         # Extend the best by non-junk elements on each end.  In particular,
-//         # "popular" non-junk elements aren't in b2j, which greatly speeds
-//         # the inner loop above, but also means "the best" match so far
-//         # doesn't contain any junk *or* popular non-junk elements.
-//         while besti > alo and bestj > blo and \
-//               not isbjunk(b[bestj-1]) and \
-//               a[besti-1] == b[bestj-1]:
-//             besti, bestj, bestsize = besti-1, bestj-1, bestsize+1
-//         while besti+bestsize < ahi and bestj+bestsize < bhi and \
-//               not isbjunk(b[bestj+bestsize]) and \
-//               a[besti+bestsize] == b[bestj+bestsize]:
-//             bestsize += 1
-
-//         # Now that we have a wholly interesting match (albeit possibly
-//         # empty!), we may as well suck up the matching junk on each
-//         # side of it too.  Can't think of a good reason not to, and it
-//         # saves post-processing the (possibly considerable) expense of
-//         # figuring out what to do with it.  In the case of an empty
-//         # interesting match, this is clearly the right thing to do,
-//         # because no other kind of match is possible in the regions.
-//         while besti > alo and bestj > blo and \
-//               isbjunk(b[bestj-1]) and \
-//               a[besti-1] == b[bestj-1]:
-//             besti, bestj, bestsize = besti-1, bestj-1, bestsize+1
-//         while besti+bestsize < ahi and bestj+bestsize < bhi and \
-//               isbjunk(b[bestj+bestsize]) and \
-//               a[besti+bestsize] == b[bestj+bestsize]:
-//             bestsize = bestsize + 1
-
-//         return Match(besti, bestj, bestsize)
 
 //     def get_matching_blocks(self):
 //         """Return list of triples describing matching subsequences.
