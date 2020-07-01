@@ -70,9 +70,17 @@ pub const SequenceMatcher = struct {
         try self.chainB();
     }
 
+    fn clearB2j(self: *SequenceMatcher) void {
+        var it = self.b2j.iterator();
+        while (it.next()) |indices| {
+            indices.value.deinit();
+        }
+        self.b2j.clear();
+    }
+
     fn chainB(self: *SequenceMatcher) !void {
         var b = self.seq2;
-        self.b2j.clear();
+        self.clearB2j();
 
         var n_test = @intToFloat(f32, b.len) / 100 + 1;
 
@@ -155,14 +163,81 @@ pub const SequenceMatcher = struct {
 };
 
 test "sequence matcher - find longest match" {
+    const TestCase = struct {
+        a: []const u8,
+        b: []const u8,
+        a_lo: usize,
+        a_hi: usize,
+        b_lo: usize,
+        b_hi: usize,
+        expected: LongestMatch,
+    };
+    const testCases = [_]TestCase{
+        TestCase{
+            .a = "foo bar",
+            .b = "foo baz bar",
+            .a_lo = 0,
+            .a_hi = 7,
+            .b_lo = 0,
+            .b_hi = 11,
+            .expected = LongestMatch{
+                .a_idx = 0,
+                .b_idx = 0,
+                .size = 6,
+            },
+        },
+        TestCase{
+            .a = "foo bar",
+            .b = "foo baz bar",
+            .a_lo = 2,
+            .a_hi = 7,
+            .b_lo = 4,
+            .b_hi = 11,
+            .expected = LongestMatch{
+                .a_idx = 3,
+                .b_idx = 7,
+                .size = 4,
+            },
+        },
+        TestCase{
+            .a = "foo bar",
+            .b = "foo baz bar",
+            .a_lo = 0,
+            .a_hi = 7,
+            .b_lo = 1,
+            .b_hi = 5,
+            .expected = LongestMatch{
+                .a_idx = 1,
+                .b_idx = 1,
+                .size = 4,
+            },
+        },
+        TestCase{
+            .a = "dabcd",
+            .b = [_]u8{'d'} ** 100 ++ "abc" ++ [_]u8{'d'} ** 100,
+            .a_lo = 0,
+            .a_hi = 5,
+            .b_lo = 0,
+            .b_hi = 203,
+            .expected = LongestMatch{
+                .a_idx = 0,
+                .b_idx = 99,
+                .size = 5,
+            },
+        },
+    };
+
     const allocator = std.testing.allocator;
-    // var sm = try SequenceMatcher.init(allocator, "abcd", "bcde");
-    var sm = try SequenceMatcher.init(allocator, " abcd", "abcd abcd");
+    var sm = try SequenceMatcher.init(allocator, "", "");
     defer sm.deinit();
-    var lm = try sm.findLongestMatch(0, 5, 0, 9);
-    assert(lm.a_idx == 0);
-    assert(lm.b_idx == 4);
-    assert(lm.size == 5);
+
+    for (testCases) |testCase| {
+        try sm.setSeqs(testCase.a, testCase.b);
+        var lm = try sm.findLongestMatch(testCase.a_lo, testCase.a_hi, testCase.b_lo, testCase.b_hi);
+        assert(lm.a_idx == testCase.expected.a_idx);
+        assert(lm.b_idx == testCase.expected.b_idx);
+        assert(lm.size == testCase.expected.size);
+    }
 }
 
 //     def get_matching_blocks(self):
