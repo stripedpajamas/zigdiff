@@ -1,14 +1,33 @@
 const std = @import("std");
 const mem = std.mem;
 const assert = std.debug.assert;
+const sort = std.sort;
 const ArrayList = std.ArrayList;
+const TailQueue = std.TailQueue;
 const AutoHashMap = std.AutoHashMap;
 
-pub const LongestMatch = struct {
+pub const Match = struct {
     a_idx: usize,
     b_idx: usize,
     size: usize,
 };
+const MatchParams = struct {
+    a_lo: usize,
+    a_hi: usize,
+    b_lo: usize,
+    b_hi: usize,
+};
+
+fn matchLessThan(match_a: Match, match_b: Match) bool {
+    // is match_a < match_b ?
+    if (match_a.a_idx < match_b.a_idx) return true;
+    if (match_a.a_idx > match_b.a_idx) return false;
+    if (match_a.a_idx == match_b.a_idx) {
+        if (match_a.b_idx < match_b.b_idx) return true;
+        if (match_a.b_idx > match_b.b_idx) return false;
+    }
+    return true;
+}
 
 pub const SequenceMatcher = struct {
     seq1: []const u8,
@@ -16,7 +35,7 @@ pub const SequenceMatcher = struct {
     allocator: *mem.Allocator,
 
     b2j: AutoHashMap(u8, ArrayList(usize)),
-    matching_blocks: []i32, 
+    matching_blocks: ?ArrayList(Match),
     opcodes: []i32,
     full_b_count: []i32,
 
@@ -27,7 +46,7 @@ pub const SequenceMatcher = struct {
             .seq1 = undefined,
             .seq2 = undefined,
             .b2j = b2j,
-            .matching_blocks = undefined,
+            .matching_blocks = null,
             .opcodes = undefined,
             .full_b_count = undefined,
         };
@@ -41,6 +60,9 @@ pub const SequenceMatcher = struct {
             indices.value.deinit();
         }
         self.b2j.deinit();
+        if (self.matching_blocks) |mb| {
+            mb.deinit();
+        }
     }
     
     pub fn setSeqs(self: *SequenceMatcher, a: []const u8, b: []const u8) !void {
@@ -54,7 +76,10 @@ pub const SequenceMatcher = struct {
         }
 
         self.seq1 = a;
-        self.matching_blocks = undefined;
+        if (self.matching_blocks) |mb| {
+            mb.deinit();
+        }
+        self.matching_blocks = null;
         self.opcodes = undefined;
     }
 
@@ -63,7 +88,10 @@ pub const SequenceMatcher = struct {
             return;
         }
         self.seq2 = b;
-        self.matching_blocks = undefined;
+        if (self.matching_blocks) |mb| {
+            mb.deinit();
+        }
+        self.matching_blocks = null;
         self.opcodes = undefined;
         self.full_b_count = undefined;
 
@@ -82,12 +110,8 @@ pub const SequenceMatcher = struct {
         var b = self.seq2;
         self.clearB2j();
 
-        var n_test = @intToFloat(f32, b.len) / 100 + 1;
-
         for (b) |byte, idx| {
             if (self.b2j.getValue(byte)) |*byte_idxs| {
-                var byte_idx_size = @intToFloat(f32, byte_idxs.items.len);
-                if (b.len >= 200 and byte_idx_size > n_test) continue;
                 try byte_idxs.append(idx);
                 _ = try self.b2j.put(byte, byte_idxs.*);
             } else {
@@ -96,9 +120,25 @@ pub const SequenceMatcher = struct {
                 _ = try self.b2j.put(byte, byte_idxs);
             }
         }
+        if (b.len >= 200) {
+            var popular_bytes = ArrayList(u8).init(self.allocator);
+            defer popular_bytes.deinit();
+            var n_test = @intToFloat(f32, b.len) / 100 + 1;
+            var it = self.b2j.iterator();
+            while (it.next()) |kv| {
+                var byte_idx_size = @intToFloat(f32, kv.value.items.len);
+                if (byte_idx_size > n_test) {
+                    kv.value.deinit();
+                    try popular_bytes.append(kv.key);
+                }
+            }
+            for (popular_bytes.items) |popular_byte| {
+                _ = self.b2j.remove(popular_byte);
+            }
+        }
     }
 
-    fn findLongestMatch(self: *SequenceMatcher, a_lo: usize, a_hi: usize, b_lo: usize, b_hi: usize) !LongestMatch {
+    fn findLongestMatch(self: *SequenceMatcher, a_lo: usize, a_hi: usize, b_lo: usize, b_hi: usize) !Match {
         var a = self.seq1;
         var b = self.seq2;
         assert(a_hi <= a.len and b_hi <= b.len);
@@ -118,7 +158,6 @@ pub const SequenceMatcher = struct {
             } else {
                 indices = &nothing;
             }
-
             var next_j2_len: AutoHashMap(usize, usize) = undefined;
             var updated_j2_len = false;
             for (indices) |j| {
@@ -141,6 +180,7 @@ pub const SequenceMatcher = struct {
                 j2_len.deinit();
                 j2_len = next_j2_len;
             }
+            j2_len.clear();
         }
         j2_len.deinit();
 
@@ -154,15 +194,75 @@ pub const SequenceMatcher = struct {
             best_size += 1;
         }
 
-        return LongestMatch{
+        return Match{
             .a_idx = best_i,
             .b_idx = best_j,
             .size = best_size,
         };
     }
+
+    pub fn getMatchingBlocks(self: *SequenceMatcher) ![]Match {
+        if (self.matching_blocks) |mb| {
+            return mb.items;
+        }
+        
+        var len_a = self.seq1.len;
+        var len_b = self.seq2.len;
+
+        var matching_blocks = ArrayList(Match).init(self.allocator);
+        var queue = TailQueue(MatchParams).init();
+        var initial_params = try queue.createNode(MatchParams{
+            .a_lo = 0,
+            .a_hi = len_a,
+            .b_lo = 0,
+            .b_hi = len_b,
+        }, self.allocator);
+        queue.append(initial_params);
+
+        var prev_params = initial_params;
+        while (queue.pop()) |queue_node| {
+            var params = queue_node.data;
+            var match = try self.findLongestMatch(params.a_lo, params.a_hi, params.b_lo, params.b_hi);
+            if (match.size > 0) {
+                try matching_blocks.append(match);
+                if (params.a_lo < match.a_idx and params.b_lo < match.b_idx) {
+                    var next_params = try queue.createNode(MatchParams{
+                        .a_lo = params.a_lo,
+                        .a_hi = match.a_idx,
+                        .b_lo = params.b_lo,
+                        .b_hi = match.b_idx,
+                    }, self.allocator);
+                    queue.append(next_params);
+                }
+                if (match.a_idx + match.size < params.a_hi and match.b_idx + match.size < params.b_hi) {
+                    var next_params = try queue.createNode(MatchParams{
+                        .a_lo = match.a_idx + match.size,
+                        .a_hi = params.a_hi,
+                        .b_lo = match.b_idx + match.size,
+                        .b_hi = params.b_hi,
+                    }, self.allocator);
+                    queue.append(next_params);
+                }
+            }
+            queue.destroyNode(prev_params, self.allocator);
+            prev_params = queue_node;
+        }
+
+        sort.sort(Match, matching_blocks.items, matchLessThan);
+
+        try matching_blocks.append(Match{
+            .a_idx = len_a,
+            .b_idx = len_b,
+            .size = 0,
+        });
+
+        self.matching_blocks = matching_blocks;
+        return matching_blocks.items;
+    }
+
 };
 
-test "sequence matcher - find longest match" {
+test "find longest match" {
     const TestCase = struct {
         a: []const u8,
         b: []const u8,
@@ -170,7 +270,7 @@ test "sequence matcher - find longest match" {
         a_hi: usize,
         b_lo: usize,
         b_hi: usize,
-        expected: LongestMatch,
+        expected: Match,
     };
     const testCases = [_]TestCase{
         TestCase{
@@ -180,7 +280,7 @@ test "sequence matcher - find longest match" {
             .a_hi = 7,
             .b_lo = 0,
             .b_hi = 11,
-            .expected = LongestMatch{
+            .expected = Match{
                 .a_idx = 0,
                 .b_idx = 0,
                 .size = 6,
@@ -193,7 +293,7 @@ test "sequence matcher - find longest match" {
             .a_hi = 7,
             .b_lo = 4,
             .b_hi = 11,
-            .expected = LongestMatch{
+            .expected = Match{
                 .a_idx = 3,
                 .b_idx = 7,
                 .size = 4,
@@ -206,7 +306,7 @@ test "sequence matcher - find longest match" {
             .a_hi = 7,
             .b_lo = 1,
             .b_hi = 5,
-            .expected = LongestMatch{
+            .expected = Match{
                 .a_idx = 1,
                 .b_idx = 1,
                 .size = 4,
@@ -219,10 +319,36 @@ test "sequence matcher - find longest match" {
             .a_hi = 5,
             .b_lo = 0,
             .b_hi = 203,
-            .expected = LongestMatch{
+            .expected = Match{
                 .a_idx = 0,
                 .b_idx = 99,
                 .size = 5,
+            },
+        },
+        TestCase{
+            .a = "abcde",
+            .b = "fghijk",
+            .a_lo = 0,
+            .a_hi = 5,
+            .b_lo = 0,
+            .b_hi = 6,
+            .expected = Match{
+                .a_idx = 0,
+                .b_idx = 0,
+                .size = 0,
+            },
+        },
+        TestCase{
+            .a = "abxcd",
+            .b = "abcd",
+            .a_lo = 0,
+            .a_hi = 5,
+            .b_lo = 0,
+            .b_hi = 4,
+            .expected = Match{
+                .a_idx = 0,
+                .b_idx = 0,
+                .size = 2,
             },
         },
     };
@@ -240,22 +366,27 @@ test "sequence matcher - find longest match" {
     }
 }
 
-//     def get_matching_blocks(self):
-//         """Return list of triples describing matching subsequences.
-//         Each triple is of the form (i, j, n), and means that
-//         a[i:i+n] == b[j:j+n].  The triples are monotonically increasing in
-//         i and in j.  New in Python 2.5, it's also guaranteed that if
-//         (i, j, n) and (i', j', n') are adjacent triples in the list, and
-//         the second is not the last triple in the list, then i+n != i' or
-//         j+n != j'.  IOW, adjacent triples never describe adjacent equal
-//         blocks.
-//         The last triple is a dummy, (len(a), len(b), 0), and is the only
-//         triple with n==0.
-//         >>> s = SequenceMatcher(None, "abxcd", "abcd")
-//         >>> list(s.get_matching_blocks())
-//         [Match(a=0, b=0, size=2), Match(a=3, b=2, size=2), Match(a=5, b=4, size=0)]
-//         """
+test "get matching blocks" {
+    var allocator = std.testing.allocator;
+    var sm = try SequenceMatcher.init(allocator, "abxcd", "abcd");
+    defer sm.deinit();
+    
+    var mbs = try sm.getMatchingBlocks();
+    var expected = [_]Match{
+        Match{ .a_idx = 0, .b_idx = 0, .size = 2 },
+        Match{ .a_idx = 3, .b_idx = 2, .size = 2 },
+        Match{ .a_idx = 5, .b_idx = 4, .size = 0 },
+    };
 
+    assert(expected.len == mbs.len);
+    for (mbs) |match, idx| {
+        assert(match.a_idx == expected[idx].a_idx);
+        assert(match.b_idx == expected[idx].b_idx);
+        assert(match.size == expected[idx].size);
+    }
+}
+
+//     def get_matching_blocks(self):
 //         if self.matching_blocks is not None:
 //             return self.matching_blocks
 //         la, lb = len(self.a), len(self.b)
