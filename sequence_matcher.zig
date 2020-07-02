@@ -115,6 +115,9 @@ pub const SequenceMatcher = struct {
             mb.deinit();
         }
         self.matching_blocks = null;
+        if (self.opcodes) |opcodes| {
+            opcodes.deinit();
+        }
         self.opcodes = null;
         self.full_b_count = undefined;
 
@@ -171,6 +174,11 @@ pub const SequenceMatcher = struct {
         var best_j = b_lo;
         var best_size: usize = 0;
         var j2_len = AutoHashMap(usize, usize).init(self.allocator);
+        var j2_len_next = AutoHashMap(usize, usize).init(self.allocator);
+        defer {
+            j2_len.deinit();
+            j2_len_next.deinit();
+        }
         var nothing = [0]usize{};
 
         var i = a_lo;
@@ -181,31 +189,22 @@ pub const SequenceMatcher = struct {
             } else {
                 indices = &nothing;
             }
-            var next_j2_len: AutoHashMap(usize, usize) = undefined;
-            var updated_j2_len = false;
             for (indices) |j| {
                 if (j < b_lo) continue;
                 if (j >= b_hi) break;
                 var k = (if (j == 0) 0 else (j2_len.getValue(j - 1) orelse 0)) + 1;
-
-                if (!updated_j2_len) {
-                    next_j2_len = AutoHashMap(usize, usize).init(self.allocator);
-                    updated_j2_len = true;
-                }
-                _ = try next_j2_len.put(j, k);
+                _ = try j2_len_next.put(j, k);
                 if (k > best_size) {
                     best_i = i + 1 - k;
                     best_j = j + 1 - k;
                     best_size = k;
                 }
             }
-            if (updated_j2_len) {
-                j2_len.deinit();
-                j2_len = next_j2_len;
-            }
-            j2_len.clear();
+            var tmp = j2_len;
+            j2_len = j2_len_next;
+            j2_len_next = tmp;
+            j2_len_next.clear();
         }
-        j2_len.deinit();
 
         while (best_i > a_lo and best_j > b_lo and a[best_i - 1] == b[best_j - 1]) {
             best_i -= 1;
@@ -233,6 +232,7 @@ pub const SequenceMatcher = struct {
         var len_b = self.seq2.len;
 
         var matching_blocks = ArrayList(Match).init(self.allocator);
+        defer matching_blocks.deinit();
         var queue = TailQueue(MatchParams).init();
         var initial_params = try queue.createNode(MatchParams{
             .a_lo = 0,
@@ -273,14 +273,44 @@ pub const SequenceMatcher = struct {
 
         sort.sort(Match, matching_blocks.items, matchLessThan);
 
-        try matching_blocks.append(Match{
+        var a_idx: usize = 0;
+        var b_idx: usize = 0;
+        var size: usize = 0;
+        var non_adjacent = ArrayList(Match).init(self.allocator);
+        errdefer non_adjacent.deinit();
+        for (matching_blocks.items) |match| {
+            if (a_idx + size == match.a_idx and b_idx + size == match.b_idx) {
+                size += match.size;
+            } else {
+                if (size > 0) {
+                    try non_adjacent.append(Match{
+                        .a_idx = a_idx,
+                        .b_idx = b_idx,
+                        .size = size,
+                    });
+                }
+                a_idx = match.a_idx;
+                b_idx = match.b_idx;
+                size = match.size;
+            }
+        }
+        if (size > 0) {
+            try non_adjacent.append(Match{
+                .a_idx = a_idx,
+                .b_idx = b_idx,
+                .size = size,
+            });
+        }
+
+        // sentinal match
+        try non_adjacent.append(Match{
             .a_idx = len_a,
             .b_idx = len_b,
             .size = 0,
         });
 
-        self.matching_blocks = matching_blocks;
-        return matching_blocks.items;
+        self.matching_blocks = non_adjacent;
+        return non_adjacent.items;
     }
 
     pub fn getOpcodes(self: *SequenceMatcher) ![]Opcode {
@@ -311,8 +341,8 @@ pub const SequenceMatcher = struct {
                     .b_end = match.b_idx,
                 });
             }
-            i += match.a_idx + match.size;
-            j += match.b_idx + match.size;
+            i = match.a_idx + match.size;
+            j = match.b_idx + match.size;
             if (match.size > 0) {
                 try opcodes.append(Opcode{
                     .tag = OpcodeTag.Equal,
@@ -478,6 +508,33 @@ test "get opcodes" {
                     .a_start = 0,
                     .a_end = 100,
                     .b_start = 1,
+                    .b_end = 101,
+                },
+            },
+        },
+        TestCase{
+            .a = "b" ** 100,
+            .b = "b" ** 50 ++ "a" ++ "b" ** 50,
+            .expected = &[_]Opcode{
+                Opcode{
+                    .tag = OpcodeTag.Equal,
+                    .a_start = 0,
+                    .a_end = 50,
+                    .b_start = 0,
+                    .b_end = 50,
+                },
+                Opcode{
+                    .tag = OpcodeTag.Insert,
+                    .a_start = 50,
+                    .a_end = 50,
+                    .b_start = 50,
+                    .b_end = 51,
+                },
+                Opcode{
+                    .tag = OpcodeTag.Equal,
+                    .a_start = 50,
+                    .a_end = 100,
+                    .b_start = 51,
                     .b_end = 101,
                 },
             },
