@@ -539,6 +539,33 @@ test "get opcodes" {
                 },
             },
         },
+        TestCase{
+            .a = "a" ** 40 ++ "c" ++ "b" ** 40,
+            .b = "a" ** 40 ++ "b" ** 40,
+            .expected = &[_]Opcode{
+                Opcode{
+                    .tag = OpcodeTag.Equal,
+                    .a_start = 0,
+                    .a_end = 40,
+                    .b_start = 0,
+                    .b_end = 40,
+                },
+                Opcode{
+                    .tag = OpcodeTag.Delete,
+                    .a_start = 40,
+                    .a_end = 41,
+                    .b_start = 40,
+                    .b_end = 40,
+                },
+                Opcode{
+                    .tag = OpcodeTag.Equal,
+                    .a_start = 41,
+                    .a_end = 81,
+                    .b_start = 40,
+                    .b_end = 80,
+                },
+            },
+        },
     };
 
     var sm = try SequenceMatcher.init(testing.allocator, "", "");
