@@ -2,6 +2,7 @@ const std = @import("std");
 const mem = std.mem;
 const assert = std.debug.assert;
 const sort = std.sort;
+const testing = std.testing;
 const ArrayList = std.ArrayList;
 const TailQueue = std.TailQueue;
 const AutoHashMap = std.AutoHashMap;
@@ -11,11 +12,27 @@ pub const Match = struct {
     b_idx: usize,
     size: usize,
 };
+
 const MatchParams = struct {
     a_lo: usize,
     a_hi: usize,
     b_lo: usize,
     b_hi: usize,
+};
+
+const OpcodeTag = enum {
+    Replace,
+    Delete,
+    Insert,
+    Equal,
+};
+
+const Opcode = struct {
+    tag: OpcodeTag,
+    a_start: usize,
+    a_end: usize,
+    b_start: usize,
+    b_end: usize,
 };
 
 fn matchLessThan(match_a: Match, match_b: Match) bool {
@@ -36,7 +53,7 @@ pub const SequenceMatcher = struct {
 
     b2j: AutoHashMap(u8, ArrayList(usize)),
     matching_blocks: ?ArrayList(Match),
-    opcodes: []i32,
+    opcodes: ?ArrayList(Opcode),
     full_b_count: []i32,
 
     pub fn init(allocator: *mem.Allocator, a: []const u8, b: []const u8) !SequenceMatcher {
@@ -63,6 +80,9 @@ pub const SequenceMatcher = struct {
         if (self.matching_blocks) |mb| {
             mb.deinit();
         }
+        if (self.opcodes) |opcodes| {
+            opcodes.deinit();
+        }
     }
     
     pub fn setSeqs(self: *SequenceMatcher, a: []const u8, b: []const u8) !void {
@@ -80,7 +100,10 @@ pub const SequenceMatcher = struct {
             mb.deinit();
         }
         self.matching_blocks = null;
-        self.opcodes = undefined;
+        if (self.opcodes) |opcodes| {
+            opcodes.deinit();
+        }
+        self.opcodes = null;
     }
 
     pub fn setSeq2(self: *SequenceMatcher, b: []const u8) !void {
@@ -92,7 +115,7 @@ pub const SequenceMatcher = struct {
             mb.deinit();
         }
         self.matching_blocks = null;
-        self.opcodes = undefined;
+        self.opcodes = null;
         self.full_b_count = undefined;
 
         try self.chainB();
@@ -260,6 +283,51 @@ pub const SequenceMatcher = struct {
         return matching_blocks.items;
     }
 
+    pub fn getOpcodes(self: *SequenceMatcher) ![]Opcode {
+        if (self.opcodes) |opcodes| {
+            return opcodes.items;
+        }
+        var opcodes = ArrayList(Opcode).init(self.allocator);
+
+        var i: usize = 0;
+        var j: usize = 0;
+
+        var mbs = try self.getMatchingBlocks();
+        for (mbs) |match| {
+            var tag: ?OpcodeTag = null; 
+            if (i < match.a_idx and j < match.b_idx) {
+                tag = OpcodeTag.Replace;
+            } else if (i < match.a_idx) {
+                tag = OpcodeTag.Delete;
+            } else if (j < match.b_idx) {
+                tag = OpcodeTag.Insert;
+            }
+            if (tag) |t| {
+                try opcodes.append(Opcode{
+                    .tag = t,
+                    .a_start = i,
+                    .a_end = match.a_idx,
+                    .b_start = j,
+                    .b_end = match.b_idx,
+                });
+            }
+            i += match.a_idx + match.size;
+            j += match.b_idx + match.size;
+            if (match.size > 0) {
+                try opcodes.append(Opcode{
+                    .tag = OpcodeTag.Equal,
+                    .a_start = match.a_idx,
+                    .a_end = i,
+                    .b_start = match.b_idx,
+                    .b_end = j,
+                });
+            }
+        }
+
+        self.opcodes = opcodes;
+        return opcodes.items;
+    }
+
 };
 
 test "find longest match" {
@@ -353,7 +421,7 @@ test "find longest match" {
         },
     };
 
-    const allocator = std.testing.allocator;
+    const allocator = testing.allocator;
     var sm = try SequenceMatcher.init(allocator, "", "");
     defer sm.deinit();
 
@@ -367,7 +435,7 @@ test "find longest match" {
 }
 
 test "get matching blocks" {
-    var allocator = std.testing.allocator;
+    var allocator = testing.allocator;
     var sm = try SequenceMatcher.init(allocator, "abxcd", "abcd");
     defer sm.deinit();
     
@@ -383,5 +451,52 @@ test "get matching blocks" {
         assert(match.a_idx == expected[idx].a_idx);
         assert(match.b_idx == expected[idx].b_idx);
         assert(match.size == expected[idx].size);
+    }
+}
+
+test "get opcodes" {
+    const TestCase = struct {
+        a: []const u8,
+        b: []const u8,
+        expected: []const Opcode,
+    };
+
+    const testCases = [_]TestCase{
+        TestCase{
+            .a = "b" ** 100,
+            .b = "a" ++ "b" ** 100,
+            .expected = &[_]Opcode{
+                Opcode{
+                    .tag = OpcodeTag.Insert,
+                    .a_start = 0,
+                    .a_end = 0,
+                    .b_start = 0,
+                    .b_end = 1,
+                },
+                Opcode{
+                    .tag = OpcodeTag.Equal,
+                    .a_start = 0,
+                    .a_end = 100,
+                    .b_start = 1,
+                    .b_end = 101,
+                },
+            },
+        },
+    };
+
+    var sm = try SequenceMatcher.init(testing.allocator, "", "");
+    defer sm.deinit();
+    for (testCases) |testCase| {
+        try sm.setSeqs(testCase.a, testCase.b);
+        var opcodes = try sm.getOpcodes();        
+        assert(opcodes.len == testCase.expected.len);
+        for (opcodes) |opcode, idx| {
+            var expected = testCase.expected[idx];
+            assert(opcode.tag == expected.tag);
+            assert(opcode.a_start == expected.a_start);
+            assert(opcode.a_end == expected.a_end);
+            assert(opcode.b_start == expected.b_start);
+            assert(opcode.b_end == expected.b_end);
+        }
     }
 }
