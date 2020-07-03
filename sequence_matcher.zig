@@ -63,7 +63,7 @@ pub const SequenceMatcher = struct {
     b2j: AutoHashMap(u8, ArrayList(usize)),
     matching_blocks: ?ArrayList(Match),
     opcodes: ?ArrayList(Opcode),
-    full_b_count: []i32,
+    full_b_count: ?AutoHashMap(u8, i32),
 
     pub fn init(allocator: *mem.Allocator, a: []const u8, b: []const u8) !SequenceMatcher {
         var b2j = AutoHashMap(u8, ArrayList(usize)).init(allocator);
@@ -73,8 +73,8 @@ pub const SequenceMatcher = struct {
             .seq2 = undefined,
             .b2j = b2j,
             .matching_blocks = null,
-            .opcodes = undefined,
-            .full_b_count = undefined,
+            .opcodes = null,
+            .full_b_count = null,
         };
         try sm.setSeqs(a, b);
         return sm;
@@ -91,6 +91,9 @@ pub const SequenceMatcher = struct {
         }
         if (self.opcodes) |opcodes| {
             opcodes.deinit();
+        }
+        if (self.full_b_count) |fbc| {
+            fbc.deinit();
         }
     }
 
@@ -128,7 +131,10 @@ pub const SequenceMatcher = struct {
             opcodes.deinit();
         }
         self.opcodes = null;
-        self.full_b_count = undefined;
+        if (self.full_b_count) |fbc| {
+            fbc.deinit();
+        }
+        self.full_b_count = null;
 
         try self.chainB();
     }
@@ -373,6 +379,38 @@ pub const SequenceMatcher = struct {
             sum_of_matches += match.size;
         }
         return calculateRatio(sum_of_matches, self.seq1.len + self.seq2.len);
+    }
+
+    pub fn quickRatio(self: *SequenceMatcher) !f32 {
+        var full_b_count: AutoHashMap(u8, i32) = undefined;
+        if (self.full_b_count) |fbc| {
+            full_b_count = fbc;
+        } else {
+            full_b_count = AutoHashMap(u8, i32).init(self.allocator);
+            for (self.seq2) |byte| {
+                if (full_b_count.getValue(byte)) |count| {
+                    _ = try full_b_count.put(byte, count + 1);
+                } else {
+                    _ = try full_b_count.put(byte, 0);
+                }
+            }
+            self.full_b_count = full_b_count;
+        }
+
+        var avail = AutoHashMap(u8, i32).init(self.allocator);
+        defer avail.deinit();
+        var matches: usize = 0;
+        for (self.seq2) |byte| {
+            if (avail.getValue(byte)) |a| {
+                _ = try avail.put(byte, a -1);
+            } else {
+                _ = try avail.put(byte, full_b_count.getValue(byte) orelse 0);
+            }
+            if (avail.getValue(byte)) |a| {
+                if (a > 0) matches += 1;
+            }
+        }
+        return calculateRatio(matches, self.seq1.len + self.seq2.len);
     }
 };
 
@@ -641,6 +679,7 @@ test "ratio" {
     for (testCases) |testCase| {
         try sm.setSeqs(testCase.a, testCase.b);
         var actual = try sm.ratio();
+        var quick = try sm.quickRatio();
         assert(std.math.approxEq(f32, actual, testCase.expected, 0.001));
     }
 }
