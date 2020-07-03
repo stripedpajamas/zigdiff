@@ -412,6 +412,12 @@ pub const SequenceMatcher = struct {
         }
         return calculateRatio(matches, self.seq1.len + self.seq2.len);
     }
+
+    pub fn realQuickRatio(self: *SequenceMatcher) f32 {
+        var len_a = self.seq1.len;
+        var len_b = self.seq2.len;
+        return calculateRatio(if (len_a < len_b) len_a else len_b, len_a + len_b);
+    }
 };
 
 test "find longest match" {
@@ -680,6 +686,7 @@ test "ratio" {
         try sm.setSeqs(testCase.a, testCase.b);
         var actual = try sm.ratio();
         var quick = try sm.quickRatio();
+        var real_quick = sm.realQuickRatio();
         assert(std.math.approxEq(f32, actual, testCase.expected, 0.001));
     }
 }
