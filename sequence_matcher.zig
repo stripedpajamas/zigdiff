@@ -35,6 +35,15 @@ const Opcode = struct {
     b_end: usize,
 };
 
+fn calculateRatio(matches: usize, length: usize) f32 {
+    var m = @intToFloat(f32, matches);
+    var l = @intToFloat(f32, length);
+    if (length > 0) {
+        return 2.0 * m / l;
+    }
+    return 1.0;
+} 
+
 fn matchLessThan(match_a: Match, match_b: Match) bool {
     // is match_a < match_b ?
     if (match_a.a_idx < match_b.a_idx) return true;
@@ -84,7 +93,7 @@ pub const SequenceMatcher = struct {
             opcodes.deinit();
         }
     }
-    
+
     pub fn setSeqs(self: *SequenceMatcher, a: []const u8, b: []const u8) !void {
         self.setSeq1(a);
         try self.setSeq2(b);
@@ -227,7 +236,7 @@ pub const SequenceMatcher = struct {
         if (self.matching_blocks) |mb| {
             return mb.items;
         }
-        
+
         var len_a = self.seq1.len;
         var len_b = self.seq2.len;
 
@@ -324,7 +333,7 @@ pub const SequenceMatcher = struct {
 
         var mbs = try self.getMatchingBlocks();
         for (mbs) |match| {
-            var tag: ?OpcodeTag = null; 
+            var tag: ?OpcodeTag = null;
             if (i < match.a_idx and j < match.b_idx) {
                 tag = OpcodeTag.Replace;
             } else if (i < match.a_idx) {
@@ -358,6 +367,13 @@ pub const SequenceMatcher = struct {
         return opcodes.items;
     }
 
+    pub fn ratio(self: *SequenceMatcher) !f32 {
+        var sum_of_matches: usize = 0;
+        for (try self.getMatchingBlocks()) |match| {
+            sum_of_matches += match.size;
+        }
+        return calculateRatio(sum_of_matches, self.seq1.len + self.seq2.len);
+    }
 };
 
 test "find longest match" {
@@ -468,7 +484,7 @@ test "get matching blocks" {
     var allocator = testing.allocator;
     var sm = try SequenceMatcher.init(allocator, "abxcd", "abcd");
     defer sm.deinit();
-    
+
     var mbs = try sm.getMatchingBlocks();
     var expected = [_]Match{
         Match{ .a_idx = 0, .b_idx = 0, .size = 2 },
@@ -572,7 +588,7 @@ test "get opcodes" {
     defer sm.deinit();
     for (testCases) |testCase| {
         try sm.setSeqs(testCase.a, testCase.b);
-        var opcodes = try sm.getOpcodes();        
+        var opcodes = try sm.getOpcodes();
         assert(opcodes.len == testCase.expected.len);
         for (opcodes) |opcode, idx| {
             var expected = testCase.expected[idx];
@@ -582,5 +598,49 @@ test "get opcodes" {
             assert(opcode.b_start == expected.b_start);
             assert(opcode.b_end == expected.b_end);
         }
+    }
+}
+
+test "ratio" {
+    const TestCase = struct {
+        a: []const u8,
+        b: []const u8,
+        expected: f32,
+    };
+
+    const testCases = [_]TestCase{
+        TestCase{
+            .a = "b" ** 100,
+            .b = "a" ++ "b" ** 100,
+            .expected = 0.995,
+        },
+        TestCase{
+            .a = "b" ** 100,
+            .b = "b" ** 50 ++ "a" ++ "b" ** 50,
+            .expected = 0.995,
+        },
+        TestCase{
+            .a = "a" ** 40 ++ "c" ++ "b" ** 40,
+            .b = "a" ** 40 ++ "b" ** 40,
+            .expected = 0.994,
+        },
+        TestCase{
+            .a = "b" ** 200,
+            .b = "a" ++ "b" ** 200,
+            .expected = 0.0,
+        },
+        TestCase{
+            .a = "",
+            .b = "",
+            .expected = 1.0,
+        },
+    };
+
+    var sm = try SequenceMatcher.init(testing.allocator, "", "");
+    defer sm.deinit();
+    for (testCases) |testCase| {
+        try sm.setSeqs(testCase.a, testCase.b);
+        var actual = try sm.ratio();
+        assert(std.math.approxEq(f32, actual, testCase.expected, 0.001));
     }
 }
