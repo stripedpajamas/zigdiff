@@ -20,14 +20,14 @@ const MatchParams = struct {
     b_hi: usize,
 };
 
-const OpcodeTag = enum {
+pub const OpcodeTag = enum {
     Replace,
     Delete,
     Insert,
     Equal,
 };
 
-const Opcode = struct {
+pub const Opcode = struct {
     tag: OpcodeTag,
     a_start: usize,
     a_end: usize,
