@@ -6,6 +6,7 @@ const testing = std.testing;
 const ArrayList = std.ArrayList;
 const TailQueue = std.TailQueue;
 const AutoHashMap = std.AutoHashMap;
+const StringHashMap = std.StringHashMap;
 
 pub const Match = struct {
     a_idx: usize,
@@ -42,7 +43,7 @@ fn calculateRatio(matches: usize, length: usize) f32 {
         return 2.0 * m / l;
     }
     return 1.0;
-} 
+}
 
 fn matchLessThan(match_a: Match, match_b: Match) bool {
     // is match_a < match_b ?
@@ -55,370 +56,396 @@ fn matchLessThan(match_a: Match, match_b: Match) bool {
     return true;
 }
 
-pub const SequenceMatcher = struct {
-    seq1: []const u8,
-    seq2: []const u8,
-    allocator: *mem.Allocator,
+pub fn SequenceMatcher(comptime T: type) type {
+    assert(T == []const u8 or T == []const []const u8);
 
-    b2j: AutoHashMap(u8, ArrayList(usize)),
-    matching_blocks: ?ArrayList(Match),
-    opcodes: ?ArrayList(Opcode),
-    full_b_count: ?AutoHashMap(u8, i32),
+    const SeqType = T;
+    const ElType = if (T == []const u8) u8 else []const u8;
+    const SeqToIdxMapType = if (T == []const u8) AutoHashMap(ElType, ArrayList(usize)) else StringHashMap(ArrayList(usize));
+    const SeqToCountMapType = if (T == []const u8) AutoHashMap(ElType, i32) else StringHashMap(i32);
 
-    pub fn init(allocator: *mem.Allocator, a: []const u8, b: []const u8) !SequenceMatcher {
-        var b2j = AutoHashMap(u8, ArrayList(usize)).init(allocator);
-        var sm = SequenceMatcher{
-            .allocator = allocator,
-            .seq1 = undefined,
-            .seq2 = undefined,
-            .b2j = b2j,
-            .matching_blocks = null,
-            .opcodes = null,
-            .full_b_count = null,
-        };
-        try sm.setSeqs(a, b);
-        return sm;
-    }
+    return struct {
+        const Self = @This();
+        seq1: SeqType,
+        seq2: SeqType,
+        allocator: *mem.Allocator,
 
-    pub fn deinit(self: *SequenceMatcher) void {
-        var it = self.b2j.iterator();
-        while (it.next()) |indices| {
-            indices.value.deinit();
-        }
-        self.b2j.deinit();
-        if (self.matching_blocks) |mb| {
-            mb.deinit();
-        }
-        if (self.opcodes) |opcodes| {
-            opcodes.deinit();
-        }
-        if (self.full_b_count) |fbc| {
-            fbc.deinit();
-        }
-    }
+        b2j: SeqToIdxMapType,
+        matching_blocks: ?ArrayList(Match),
+        opcodes: ?ArrayList(Opcode),
+        full_b_count: ?SeqToCountMapType,
 
-    pub fn setSeqs(self: *SequenceMatcher, a: []const u8, b: []const u8) !void {
-        self.setSeq1(a);
-        try self.setSeq2(b);
-    }
-
-    pub fn setSeq1(self: *SequenceMatcher, a: []const u8) void {
-        if (mem.eql(u8, a, self.seq1)) {
-            return;
+        pub fn init(allocator: *mem.Allocator) Self {
+            return Self{
+                .allocator = allocator,
+                .seq1 = &[0]ElType{},
+                .seq2 = &[0]ElType{},
+                .b2j = SeqToIdxMapType.init(allocator),
+                .matching_blocks = null,
+                .opcodes = null,
+                .full_b_count = null,
+            };
         }
 
-        self.seq1 = a;
-        if (self.matching_blocks) |mb| {
-            mb.deinit();
-        }
-        self.matching_blocks = null;
-        if (self.opcodes) |opcodes| {
-            opcodes.deinit();
-        }
-        self.opcodes = null;
-    }
-
-    pub fn setSeq2(self: *SequenceMatcher, b: []const u8) !void {
-        if (mem.eql(u8, b, self.seq2)) {
-            return;
-        }
-        self.seq2 = b;
-        if (self.matching_blocks) |mb| {
-            mb.deinit();
-        }
-        self.matching_blocks = null;
-        if (self.opcodes) |opcodes| {
-            opcodes.deinit();
-        }
-        self.opcodes = null;
-        if (self.full_b_count) |fbc| {
-            fbc.deinit();
-        }
-        self.full_b_count = null;
-
-        try self.chainB();
-    }
-
-    fn clearB2j(self: *SequenceMatcher) void {
-        var it = self.b2j.iterator();
-        while (it.next()) |indices| {
-            indices.value.deinit();
-        }
-        self.b2j.clear();
-    }
-
-    fn chainB(self: *SequenceMatcher) !void {
-        var b = self.seq2;
-        self.clearB2j();
-
-        for (b) |byte, idx| {
-            if (self.b2j.getValue(byte)) |*byte_idxs| {
-                try byte_idxs.append(idx);
-                _ = try self.b2j.put(byte, byte_idxs.*);
-            } else {
-                var byte_idxs = ArrayList(usize).init(self.allocator);
-                try byte_idxs.append(idx);
-                _ = try self.b2j.put(byte, byte_idxs);
-            }
-        }
-        if (b.len >= 200) {
-            var popular_bytes = ArrayList(u8).init(self.allocator);
-            defer popular_bytes.deinit();
-            var n_test = @intToFloat(f32, b.len) / 100 + 1;
+        pub fn deinit(self: *Self) void {
             var it = self.b2j.iterator();
-            while (it.next()) |kv| {
-                var byte_idx_size = @intToFloat(f32, kv.value.items.len);
-                if (byte_idx_size > n_test) {
-                    kv.value.deinit();
-                    try popular_bytes.append(kv.key);
+            while (it.next()) |indices| {
+                indices.value.deinit();
+            }
+            self.b2j.deinit();
+            if (self.matching_blocks) |mb| {
+                mb.deinit();
+            }
+            if (self.opcodes) |opcodes| {
+                opcodes.deinit();
+            }
+            if (self.full_b_count) |fbc| {
+                fbc.deinit();
+            }
+        }
+
+        pub fn setSeqs(self: *Self, a: SeqType, b: SeqType) !void {
+            self.setSeq1(a);
+            try self.setSeq2(b);
+        }
+
+        pub fn setSeq1(self: *Self, a: SeqType) void {
+            if (self.equalSeqs(a, self.seq1)) {
+                return;
+            }
+
+            self.seq1 = a;
+            if (self.matching_blocks) |mb| {
+                mb.deinit();
+            }
+            self.matching_blocks = null;
+            if (self.opcodes) |opcodes| {
+                opcodes.deinit();
+            }
+            self.opcodes = null;
+        }
+
+        pub fn setSeq2(self: *Self, b: SeqType) !void {
+            if (self.equalSeqs(b, self.seq2)) {
+                return;
+            }
+            self.seq2 = b;
+            if (self.matching_blocks) |mb| {
+                mb.deinit();
+            }
+            self.matching_blocks = null;
+            if (self.opcodes) |opcodes| {
+                opcodes.deinit();
+            }
+            self.opcodes = null;
+            if (self.full_b_count) |fbc| {
+                fbc.deinit();
+            }
+            self.full_b_count = null;
+
+            try self.chainB();
+        }
+
+        fn clearB2j(self: *Self) void {
+            var it = self.b2j.iterator();
+            while (it.next()) |indices| {
+                indices.value.deinit();
+            }
+            self.b2j.clear();
+        }
+
+        fn chainB(self: *Self) !void {
+            var b = self.seq2;
+            self.clearB2j();
+
+            for (b) |el, idx| {
+                if (self.b2j.getValue(el)) |*idxs| {
+                    try idxs.append(idx);
+                    _ = try self.b2j.put(el, idxs.*);
+                } else {
+                    var idxs = ArrayList(usize).init(self.allocator);
+                    try idxs.append(idx);
+                    _ = try self.b2j.put(el, idxs);
                 }
             }
-            for (popular_bytes.items) |popular_byte| {
-                _ = self.b2j.remove(popular_byte);
-            }
-        }
-    }
-
-    fn findLongestMatch(self: *SequenceMatcher, a_lo: usize, a_hi: usize, b_lo: usize, b_hi: usize) !Match {
-        var a = self.seq1;
-        var b = self.seq2;
-        assert(a_hi <= a.len and b_hi <= b.len);
-
-        var b2j = self.b2j;
-        var best_i = a_lo;
-        var best_j = b_lo;
-        var best_size: usize = 0;
-        var j2_len = AutoHashMap(usize, usize).init(self.allocator);
-        var j2_len_next = AutoHashMap(usize, usize).init(self.allocator);
-        defer {
-            j2_len.deinit();
-            j2_len_next.deinit();
-        }
-        var nothing = [0]usize{};
-
-        var i = a_lo;
-        while (i < a_hi) : (i += 1) {
-            var indices: []usize = undefined;
-            if (b2j.getValue(a[i])) |value| {
-                indices = value.items;
-            } else {
-                indices = &nothing;
-            }
-            for (indices) |j| {
-                if (j < b_lo) continue;
-                if (j >= b_hi) break;
-                var k = (if (j == 0) 0 else (j2_len.getValue(j - 1) orelse 0)) + 1;
-                _ = try j2_len_next.put(j, k);
-                if (k > best_size) {
-                    best_i = i + 1 - k;
-                    best_j = j + 1 - k;
-                    best_size = k;
+            if (b.len >= 200) {
+                var popular_els = ArrayList(ElType).init(self.allocator);
+                defer popular_els.deinit();
+                var n_test = @intToFloat(f32, b.len) / 100 + 1;
+                var it = self.b2j.iterator();
+                while (it.next()) |kv| {
+                    var el_idx_size = @intToFloat(f32, kv.value.items.len);
+                    if (el_idx_size > n_test) {
+                        kv.value.deinit();
+                        try popular_els.append(kv.key);
+                    }
+                }
+                for (popular_els.items) |popular_el| {
+                    _ = self.b2j.remove(popular_el);
                 }
             }
-            var tmp = j2_len;
-            j2_len = j2_len_next;
-            j2_len_next = tmp;
-            j2_len_next.clear();
         }
 
-        while (best_i > a_lo and best_j > b_lo and a[best_i - 1] == b[best_j - 1]) {
-            best_i -= 1;
-            best_j -= 1;
-            best_size += 1;
-        }
+        fn findLongestMatch(self: *Self, a_lo: usize, a_hi: usize, b_lo: usize, b_hi: usize) !Match {
+            var a = self.seq1;
+            var b = self.seq2;
+            assert(a_hi <= a.len and b_hi <= b.len);
 
-        while (best_i + best_size < a_hi and best_j + best_size < b_hi and a[best_i + best_size] == b[best_j + best_size]) {
-            best_size += 1;
-        }
+            var b2j = self.b2j;
+            var best_i = a_lo;
+            var best_j = b_lo;
+            var best_size: usize = 0;
+            var j2_len = AutoHashMap(usize, usize).init(self.allocator);
+            var j2_len_next = AutoHashMap(usize, usize).init(self.allocator);
+            defer {
+                j2_len.deinit();
+                j2_len_next.deinit();
+            }
+            var nothing = [0]usize{};
 
-        return Match{
-            .a_idx = best_i,
-            .b_idx = best_j,
-            .size = best_size,
-        };
-    }
-
-    pub fn getMatchingBlocks(self: *SequenceMatcher) ![]Match {
-        if (self.matching_blocks) |mb| {
-            return mb.items;
-        }
-
-        var len_a = self.seq1.len;
-        var len_b = self.seq2.len;
-
-        var matching_blocks = ArrayList(Match).init(self.allocator);
-        defer matching_blocks.deinit();
-        var queue = TailQueue(MatchParams).init();
-        var initial_params = try queue.createNode(MatchParams{
-            .a_lo = 0,
-            .a_hi = len_a,
-            .b_lo = 0,
-            .b_hi = len_b,
-        }, self.allocator);
-        queue.append(initial_params);
-
-        var prev_params = initial_params;
-        while (queue.pop()) |queue_node| {
-            var params = queue_node.data;
-            var match = try self.findLongestMatch(params.a_lo, params.a_hi, params.b_lo, params.b_hi);
-            if (match.size > 0) {
-                try matching_blocks.append(match);
-                if (params.a_lo < match.a_idx and params.b_lo < match.b_idx) {
-                    var next_params = try queue.createNode(MatchParams{
-                        .a_lo = params.a_lo,
-                        .a_hi = match.a_idx,
-                        .b_lo = params.b_lo,
-                        .b_hi = match.b_idx,
-                    }, self.allocator);
-                    queue.append(next_params);
+            var i = a_lo;
+            while (i < a_hi) : (i += 1) {
+                var indices: []usize = undefined;
+                if (b2j.getValue(a[i])) |value| {
+                    indices = value.items;
+                } else {
+                    indices = &nothing;
                 }
-                if (match.a_idx + match.size < params.a_hi and match.b_idx + match.size < params.b_hi) {
-                    var next_params = try queue.createNode(MatchParams{
-                        .a_lo = match.a_idx + match.size,
-                        .a_hi = params.a_hi,
-                        .b_lo = match.b_idx + match.size,
-                        .b_hi = params.b_hi,
-                    }, self.allocator);
-                    queue.append(next_params);
+                for (indices) |j| {
+                    if (j < b_lo) continue;
+                    if (j >= b_hi) break;
+                    var k = (if (j == 0) 0 else (j2_len.getValue(j - 1) orelse 0)) + 1;
+                    _ = try j2_len_next.put(j, k);
+                    if (k > best_size) {
+                        best_i = i + 1 - k;
+                        best_j = j + 1 - k;
+                        best_size = k;
+                    }
+                }
+                var tmp = j2_len;
+                j2_len = j2_len_next;
+                j2_len_next = tmp;
+                j2_len_next.clear();
+            }
+
+            while (best_i > a_lo and best_j > b_lo and self.equalEls(a[best_i - 1], b[best_j - 1])) {
+                best_i -= 1;
+                best_j -= 1;
+                best_size += 1;
+            }
+
+            while (best_i + best_size < a_hi and best_j + best_size < b_hi and self.equalEls(a[best_i + best_size], b[best_j + best_size])) {
+                best_size += 1;
+            }
+
+            return Match{
+                .a_idx = best_i,
+                .b_idx = best_j,
+                .size = best_size,
+            };
+        }
+
+        pub fn getMatchingBlocks(self: *Self) ![]Match {
+            if (self.matching_blocks) |mb| {
+                return mb.items;
+            }
+
+            var len_a = self.seq1.len;
+            var len_b = self.seq2.len;
+
+            var matching_blocks = ArrayList(Match).init(self.allocator);
+            defer matching_blocks.deinit();
+            var queue = TailQueue(MatchParams).init();
+            var initial_params = try queue.createNode(MatchParams{
+                .a_lo = 0,
+                .a_hi = len_a,
+                .b_lo = 0,
+                .b_hi = len_b,
+            }, self.allocator);
+            queue.append(initial_params);
+
+            var prev_params = initial_params;
+            while (queue.pop()) |queue_node| {
+                var params = queue_node.data;
+                var match = try self.findLongestMatch(params.a_lo, params.a_hi, params.b_lo, params.b_hi);
+                if (match.size > 0) {
+                    try matching_blocks.append(match);
+                    if (params.a_lo < match.a_idx and params.b_lo < match.b_idx) {
+                        var next_params = try queue.createNode(MatchParams{
+                            .a_lo = params.a_lo,
+                            .a_hi = match.a_idx,
+                            .b_lo = params.b_lo,
+                            .b_hi = match.b_idx,
+                        }, self.allocator);
+                        queue.append(next_params);
+                    }
+                    if (match.a_idx + match.size < params.a_hi and match.b_idx + match.size < params.b_hi) {
+                        var next_params = try queue.createNode(MatchParams{
+                            .a_lo = match.a_idx + match.size,
+                            .a_hi = params.a_hi,
+                            .b_lo = match.b_idx + match.size,
+                            .b_hi = params.b_hi,
+                        }, self.allocator);
+                        queue.append(next_params);
+                    }
+                }
+                queue.destroyNode(prev_params, self.allocator);
+                prev_params = queue_node;
+            }
+
+            sort.sort(Match, matching_blocks.items, matchLessThan);
+
+            var a_idx: usize = 0;
+            var b_idx: usize = 0;
+            var size: usize = 0;
+            var non_adjacent = ArrayList(Match).init(self.allocator);
+            errdefer non_adjacent.deinit();
+            for (matching_blocks.items) |match| {
+                if (a_idx + size == match.a_idx and b_idx + size == match.b_idx) {
+                    size += match.size;
+                } else {
+                    if (size > 0) {
+                        try non_adjacent.append(Match{
+                            .a_idx = a_idx,
+                            .b_idx = b_idx,
+                            .size = size,
+                        });
+                    }
+                    a_idx = match.a_idx;
+                    b_idx = match.b_idx;
+                    size = match.size;
                 }
             }
-            queue.destroyNode(prev_params, self.allocator);
-            prev_params = queue_node;
+            if (size > 0) {
+                try non_adjacent.append(Match{
+                    .a_idx = a_idx,
+                    .b_idx = b_idx,
+                    .size = size,
+                });
+            }
+
+            // sentinal match
+            try non_adjacent.append(Match{
+                .a_idx = len_a,
+                .b_idx = len_b,
+                .size = 0,
+            });
+
+            self.matching_blocks = non_adjacent;
+            return non_adjacent.items;
         }
 
-        sort.sort(Match, matching_blocks.items, matchLessThan);
+        pub fn getOpcodes(self: *Self) ![]Opcode {
+            if (self.opcodes) |opcodes| {
+                return opcodes.items;
+            }
+            var opcodes = ArrayList(Opcode).init(self.allocator);
 
-        var a_idx: usize = 0;
-        var b_idx: usize = 0;
-        var size: usize = 0;
-        var non_adjacent = ArrayList(Match).init(self.allocator);
-        errdefer non_adjacent.deinit();
-        for (matching_blocks.items) |match| {
-            if (a_idx + size == match.a_idx and b_idx + size == match.b_idx) {
-                size += match.size;
-            } else {
-                if (size > 0) {
-                    try non_adjacent.append(Match{
-                        .a_idx = a_idx,
-                        .b_idx = b_idx,
-                        .size = size,
+            var i: usize = 0;
+            var j: usize = 0;
+
+            var mbs = try self.getMatchingBlocks();
+            for (mbs) |match| {
+                var tag: ?OpcodeTag = null;
+                if (i < match.a_idx and j < match.b_idx) {
+                    tag = OpcodeTag.Replace;
+                } else if (i < match.a_idx) {
+                    tag = OpcodeTag.Delete;
+                } else if (j < match.b_idx) {
+                    tag = OpcodeTag.Insert;
+                }
+                if (tag) |t| {
+                    try opcodes.append(Opcode{
+                        .tag = t,
+                        .a_start = i,
+                        .a_end = match.a_idx,
+                        .b_start = j,
+                        .b_end = match.b_idx,
                     });
                 }
-                a_idx = match.a_idx;
-                b_idx = match.b_idx;
-                size = match.size;
-            }
-        }
-        if (size > 0) {
-            try non_adjacent.append(Match{
-                .a_idx = a_idx,
-                .b_idx = b_idx,
-                .size = size,
-            });
-        }
-
-        // sentinal match
-        try non_adjacent.append(Match{
-            .a_idx = len_a,
-            .b_idx = len_b,
-            .size = 0,
-        });
-
-        self.matching_blocks = non_adjacent;
-        return non_adjacent.items;
-    }
-
-    pub fn getOpcodes(self: *SequenceMatcher) ![]Opcode {
-        if (self.opcodes) |opcodes| {
-            return opcodes.items;
-        }
-        var opcodes = ArrayList(Opcode).init(self.allocator);
-
-        var i: usize = 0;
-        var j: usize = 0;
-
-        var mbs = try self.getMatchingBlocks();
-        for (mbs) |match| {
-            var tag: ?OpcodeTag = null;
-            if (i < match.a_idx and j < match.b_idx) {
-                tag = OpcodeTag.Replace;
-            } else if (i < match.a_idx) {
-                tag = OpcodeTag.Delete;
-            } else if (j < match.b_idx) {
-                tag = OpcodeTag.Insert;
-            }
-            if (tag) |t| {
-                try opcodes.append(Opcode{
-                    .tag = t,
-                    .a_start = i,
-                    .a_end = match.a_idx,
-                    .b_start = j,
-                    .b_end = match.b_idx,
-                });
-            }
-            i = match.a_idx + match.size;
-            j = match.b_idx + match.size;
-            if (match.size > 0) {
-                try opcodes.append(Opcode{
-                    .tag = OpcodeTag.Equal,
-                    .a_start = match.a_idx,
-                    .a_end = i,
-                    .b_start = match.b_idx,
-                    .b_end = j,
-                });
-            }
-        }
-
-        self.opcodes = opcodes;
-        return opcodes.items;
-    }
-
-    pub fn ratio(self: *SequenceMatcher) !f32 {
-        var sum_of_matches: usize = 0;
-        for (try self.getMatchingBlocks()) |match| {
-            sum_of_matches += match.size;
-        }
-        return calculateRatio(sum_of_matches, self.seq1.len + self.seq2.len);
-    }
-
-    pub fn quickRatio(self: *SequenceMatcher) !f32 {
-        var full_b_count: AutoHashMap(u8, i32) = undefined;
-        if (self.full_b_count) |fbc| {
-            full_b_count = fbc;
-        } else {
-            full_b_count = AutoHashMap(u8, i32).init(self.allocator);
-            for (self.seq2) |byte| {
-                if (full_b_count.getValue(byte)) |count| {
-                    _ = try full_b_count.put(byte, count + 1);
-                } else {
-                    _ = try full_b_count.put(byte, 0);
+                i = match.a_idx + match.size;
+                j = match.b_idx + match.size;
+                if (match.size > 0) {
+                    try opcodes.append(Opcode{
+                        .tag = OpcodeTag.Equal,
+                        .a_start = match.a_idx,
+                        .a_end = i,
+                        .b_start = match.b_idx,
+                        .b_end = j,
+                    });
                 }
             }
-            self.full_b_count = full_b_count;
+
+            self.opcodes = opcodes;
+            return opcodes.items;
         }
 
-        var avail = AutoHashMap(u8, i32).init(self.allocator);
-        defer avail.deinit();
-        var matches: usize = 0;
-        for (self.seq2) |byte| {
-            if (avail.getValue(byte)) |a| {
-                _ = try avail.put(byte, a -1);
+        pub fn ratio(self: *Self) !f32 {
+            var sum_of_matches: usize = 0;
+            for (try self.getMatchingBlocks()) |match| {
+                sum_of_matches += match.size;
+            }
+            return calculateRatio(sum_of_matches, self.seq1.len + self.seq2.len);
+        }
+
+        pub fn quickRatio(self: *Self) !f32 {
+            var full_b_count: SeqToCountMapType = undefined;
+            if (self.full_b_count) |fbc| {
+                full_b_count = fbc;
             } else {
-                _ = try avail.put(byte, full_b_count.getValue(byte) orelse 0);
+                full_b_count = SeqToCountMapType.init(self.allocator);
+                for (self.seq2) |el| {
+                    if (full_b_count.getValue(el)) |count| {
+                        _ = try full_b_count.put(el, count + 1);
+                    } else {
+                        _ = try full_b_count.put(el, 0);
+                    }
+                }
+                self.full_b_count = full_b_count;
             }
-            if (avail.getValue(byte)) |a| {
-                if (a > 0) matches += 1;
+
+            var avail = SeqToCountMapType.init(self.allocator);
+            defer avail.deinit();
+            var matches: usize = 0;
+            for (self.seq2) |el| {
+                if (avail.getValue(el)) |a| {
+                    _ = try avail.put(el, a - 1);
+                } else {
+                    _ = try avail.put(el, full_b_count.getValue(el) orelse 0);
+                }
+                if (avail.getValue(el)) |a| {
+                    if (a > 0) matches += 1;
+                }
+            }
+            return calculateRatio(matches, self.seq1.len + self.seq2.len);
+        }
+
+        pub fn realQuickRatio(self: *Self) f32 {
+            var len_a = self.seq1.len;
+            var len_b = self.seq2.len;
+            return calculateRatio(if (len_a < len_b) len_a else len_b, len_a + len_b);
+        }
+
+        fn equalSeqs(self: *Self, a: SeqType, b: SeqType) bool {
+            if (SeqType == []const u8) {
+                return mem.eql(u8, a, b);
+            }
+            if (a.len != b.len) return false;
+            for (a) |el, idx| {
+                if (!mem.eql(u8, el, b[idx])) return false;
+            }
+            return true;
+        }
+
+        fn equalEls(self: *Self, a: ElType, b: ElType) bool {
+            if (ElType == u8) {
+                return a == b;
+            } else {
+                return mem.eql(u8, a, b);
             }
         }
-        return calculateRatio(matches, self.seq1.len + self.seq2.len);
-    }
-
-    pub fn realQuickRatio(self: *SequenceMatcher) f32 {
-        var len_a = self.seq1.len;
-        var len_b = self.seq2.len;
-        return calculateRatio(if (len_a < len_b) len_a else len_b, len_a + len_b);
-    }
-};
+    };
+}
 
 test "find longest match" {
     const TestCase = struct {
@@ -512,7 +539,7 @@ test "find longest match" {
     };
 
     const allocator = testing.allocator;
-    var sm = try SequenceMatcher.init(allocator, "", "");
+    var sm = SequenceMatcher([]const u8).init(allocator);
     defer sm.deinit();
 
     for (testCases) |testCase| {
@@ -526,7 +553,8 @@ test "find longest match" {
 
 test "get matching blocks" {
     var allocator = testing.allocator;
-    var sm = try SequenceMatcher.init(allocator, "abxcd", "abcd");
+    var sm = SequenceMatcher([]const u8).init(allocator);
+    try sm.setSeqs("abxcd", "abcd");
     defer sm.deinit();
 
     var mbs = try sm.getMatchingBlocks();
@@ -628,7 +656,7 @@ test "get opcodes" {
         },
     };
 
-    var sm = try SequenceMatcher.init(testing.allocator, "", "");
+    var sm = SequenceMatcher([]const u8).init(testing.allocator);
     defer sm.deinit();
     for (testCases) |testCase| {
         try sm.setSeqs(testCase.a, testCase.b);
@@ -680,7 +708,7 @@ test "ratio" {
         },
     };
 
-    var sm = try SequenceMatcher.init(testing.allocator, "", "");
+    var sm = SequenceMatcher([]const u8).init(testing.allocator);
     defer sm.deinit();
     for (testCases) |testCase| {
         try sm.setSeqs(testCase.a, testCase.b);
@@ -689,4 +717,28 @@ test "ratio" {
         var real_quick = sm.realQuickRatio();
         assert(std.math.approxEq(f32, actual, testCase.expected, 0.001));
     }
+}
+
+test "sequence matching of strings" {
+    var sm = SequenceMatcher([]const []const u8).init(testing.allocator);
+    defer sm.deinit();
+
+    const a = [_][]const u8{
+        "one\n",
+        "two\n",
+        "three\n",
+    };
+    const b = [_][]const u8{
+        "ore\n",
+        "tree\n",
+        "emu\n",
+    };
+
+    try sm.setSeqs(a[0..], b[0..]);
+    const opcodes = try sm.getOpcodes();
+    assert(opcodes.len == 1);
+    assert(opcodes[0].a_start == 0);
+    assert(opcodes[0].a_end == 3);
+    assert(opcodes[0].b_start == 0);
+    assert(opcodes[0].b_end == 3);
 }
