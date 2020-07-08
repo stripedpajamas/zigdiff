@@ -34,6 +34,13 @@ pub const Differ = struct {
         self.sm.deinit();
     }
 
+    pub fn reset(self: *Differ) void {
+        for (self.diffs.items) |diff| {
+            self.allocator.free(diff);
+        }
+        self.diffs.items.len = 0;
+    }
+
     pub fn compare(self: *Differ, a: []const []const u8, b: []const []const u8) ![][]u8 {
         try self.sm.setSeqs(a, b);
         const opcodes = try self.sm.getOpcodes();
@@ -243,7 +250,7 @@ fn keepOriginalWhitespace(allocator: *mem.Allocator, str: []const u8, tag_str: [
     while (idx > 0 and std.ascii.isSpace(out.items[idx - 1])) {
         idx -= 1;
     }
-    out.shrink(idx);
+    out.items.len = idx;
     return out;
 }
 
@@ -260,6 +267,16 @@ test "compare" {
             .b = &[_][]const u8{ "ore\n", "tree\n", "emu\n" },
             .expected = &[_][]const u8{ "- one\n", "?  ^\n", "+ ore\n", "?  ^\n", "- two\n", "- three\n", "?  -\n", "+ tree\n", "+ emu\n" },
         },
+        TestCase{
+            .a = &[_][]const u8{ "\tI am a buggy" },
+            .b = &[_][]const u8{ "\t\tI am a bug" },
+            .expected = &[_][]const u8{ "- \tI am a buggy", "? \t          --\n", "+ \t\tI am a bug", "? +\n" },
+        },
+        TestCase{
+            .a = &[_][]const u8{ "\t \t \t^" },
+            .b = &[_][]const u8{ "\t \t \t^\n" },
+            .expected = &[_][]const u8{ "- \t \t \t^", "+ \t \t \t^\n", "? \t \t \t +\n" },
+        },
     };
 
     const allocator = testing.allocator;
@@ -269,6 +286,7 @@ test "compare" {
 
     for (testCases) |tc| {
         var diffs = try differ.compare(tc.a[0..], tc.b[0..]);
+        defer differ.reset();
         assert(diffs.len == tc.expected.len);
         for (tc.expected) |exp_line, idx| {
             var actual_line = diffs[idx];
