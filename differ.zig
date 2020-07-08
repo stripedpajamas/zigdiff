@@ -239,41 +239,40 @@ fn keepOriginalWhitespace(allocator: *mem.Allocator, str: []const u8, tag_str: [
         }
     }
     // remove right-hand side whitespace
-    var idx: usize = out.items.len - 1;
-    while (std.ascii.isSpace(out.items[idx])) {
-        if (idx == 0) break;
+    var idx: usize = out.items.len;
+    while (idx > 0 and std.ascii.isSpace(out.items[idx - 1])) {
         idx -= 1;
     }
-    out.shrink(idx + 1);
+    out.shrink(idx);
     return out;
 }
 
 test "compare" {
-    // var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    // defer arena.deinit();
-    // const allocator = &arena.allocator;
+    const TestCase = struct {
+        a: []const []const u8,
+        b: []const []const u8,
+        expected: []const []const u8,
+    };
+
+    const testCases = [_]TestCase{
+        TestCase{
+            .a = &[_][]const u8{ "one\n", "two\n", "three\n" },
+            .b = &[_][]const u8{ "ore\n", "tree\n", "emu\n" },
+            .expected = &[_][]const u8{ "- one\n", "?  ^\n", "+ ore\n", "?  ^\n", "- two\n", "- three\n", "?  -\n", "+ tree\n", "+ emu\n" },
+        },
+    };
+
     const allocator = testing.allocator;
 
     var differ = Differ.init(allocator);
     defer differ.deinit();
 
-    const a = [_][]const u8{
-        "one\n",
-        "two\n",
-        "three\n",
-    };
-    const b = [_][]const u8{
-        "ore\n",
-        "tree\n",
-        "emu\n",
-    };
-
-    var diffs = try differ.compare(a[0..], b[0..]);
-    var diff = try std.mem.join(allocator, "", diffs);
-    std.debug.warn("\n{}", .{diff});
-    //     for (diffs) |diff_line| {
-    //         std.debug.warn("{}", .{diff_line});
-    //     }
-    std.debug.warn("\n", .{});
-    allocator.free(diff);
+    for (testCases) |tc| {
+        var diffs = try differ.compare(tc.a[0..], tc.b[0..]);
+        assert(diffs.len == tc.expected.len);
+        for (tc.expected) |exp_line, idx| {
+            var actual_line = diffs[idx];
+            assert(mem.eql(u8, exp_line, actual_line));
+        }
+    }
 }
