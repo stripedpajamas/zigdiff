@@ -6,150 +6,274 @@ const Opcode = seq_matcher.Opcode;
 const mem = std.mem;
 const fmt = std.fmt;
 const testing = std.testing;
+const assert = std.debug.assert;
 const ArrayList = std.ArrayList;
 
+const SetSeq2ErrorSet = @TypeOf(seq_matcher.SequenceMatcher([]const u8).setSeq2).ReturnType.ErrorSet;
+
+// Differ takes [][]const u8 lines of input (each should end with a \n)
+// and outputs lines of Diffs ([][]const u8).
 pub const Differ = struct {
     allocator: *mem.Allocator,
-    sm: SequenceMatcher,
-    opcodes: ?[]Opcode,
-    opcodes_idx: usize,
-    frame: ?anyframe,
-    next: ?[]u8,
+    sm: SequenceMatcher([]const []const u8),
+    diffs: ArrayList([]u8),
 
-    pub fn init(allocator: *mem.Allocator) !Differ {
+    pub fn init(allocator: *mem.Allocator) Differ {
         return Differ{
             .allocator = allocator,
-            .sm = try SequenceMatcher.init(allocator, "", ""),
-            .opcodes = null,
-            .opcodes_idx = 0,
-            .frame = null,
-            .next = null,
+            .sm = SequenceMatcher([]const []const u8).init(allocator),
+            .diffs = ArrayList([]u8).init(allocator),
         };
     }
 
     pub fn deinit(self: *Differ) void {
+        for (self.diffs.items) |diff| {
+            self.allocator.free(diff);
+        }
+        self.diffs.deinit();
         self.sm.deinit();
     }
 
-    pub const CompareGenerator = struct {
-        allocator: *mem.Allocator,
-        a: []const u8,
-        b: []const u8,
-        opcodes: []Opcode,
-        curr_opcode: usize = 0,
-        dump_gen: ?DumpGenerator = null,
-        repl_gen: ?DumpGenerator = null,
-
-        pub fn next(gen: *CompareGenerator) !?[]u8 {
-            var res = try gen.takeFromGenerator();
-            if (res) |_| {
-                return res;
-            } else {
-                // our internal generators are exhausted;
-                // reset everything and move to next opcode
-                gen.dump_gen = null;
-                gen.repl_gen = null;
-                gen.initGenerator();
-                var _res = try gen.takeFromGenerator();
-                gen.curr_opcode += 1;
-                return _res;
-            }
-        }
-
-        fn takeFromGenerator(gen: *CompareGenerator) !?[]u8 {
-            var res: ?[]u8 = null;
-            if (gen.dump_gen) |*dump_gen| {
-                res = try dump_gen.next();
-            } else if (gen.repl_gen) |*repl_gen| {
-                res = try repl_gen.next();
-            }
-            return res;
-        }
-
-        fn initGenerator(gen: *CompareGenerator) void {
-            if (gen.curr_opcode >= gen.opcodes.len) return;
-            var opcode = gen.opcodes[gen.curr_opcode];
-
-            var next_dump_gen: ?DumpGenerator = null;
-            var next_repl_gen: ?DumpGenerator = null;
-
+    pub fn compare(self: *Differ, a: []const []const u8, b: []const []const u8) ![][]u8 {
+        try self.sm.setSeqs(a, b);
+        const opcodes = try self.sm.getOpcodes();
+        for (opcodes) |opcode| {
             switch (opcode.tag) {
+                OpcodeTag.Replace => {
+                    try self.fancyReplace(a, b, opcode.a_start, opcode.a_end, opcode.b_start, opcode.b_end);
+                },
                 OpcodeTag.Delete => {
-                    gen.dump_gen = DumpGenerator{
-                        .start = opcode.a_start,
-                        .end = opcode.a_end,
-                        .tag = "-",
-                        .seq = gen.a,
-                        .allocator = gen.allocator,
-                    };
+                    try self.dump("-", a, opcode.a_start, opcode.a_end);
                 },
                 OpcodeTag.Insert => {
-                    gen.dump_gen = DumpGenerator{
-                        .start = opcode.b_start,
-                        .end = opcode.b_end,
-                        .tag = "+",
-                        .seq = gen.b,
-                        .allocator = gen.allocator,
-                    };
+                    try self.dump("+", b, opcode.b_start, opcode.b_end);
                 },
                 OpcodeTag.Equal => {
-                    gen.dump_gen = DumpGenerator{
-                        .start = opcode.a_start,
-                        .end = opcode.a_end,
-                        .tag = " ",
-                        .seq = gen.a,
-                        .allocator = gen.allocator,
-                    };
+                    try self.dump(" ", a, opcode.a_start, opcode.a_end);
                 },
-                else => {},
             }
         }
-    };
-
-    pub fn compare(self: *Differ, a: []const u8, b: []const u8) !CompareGenerator {
-        try self.sm.setSeqs(a, b);
-        var opcodes = try self.sm.getOpcodes();
-        return CompareGenerator{
-            .a = a,
-            .b = b,
-            .opcodes = opcodes,
-            .allocator = self.allocator,
-        };
+        return self.diffs.items;
     }
 
-    pub const DumpGenerator = struct {
-        start: usize,
-        end: usize,
-        tag: []const u8,
-        seq: []const u8,
-        allocator: *mem.Allocator,
-
-        pub fn next(gen: *DumpGenerator) !?[]u8 {
-            if (gen.start >= gen.end) return null;
-            var res = try fmt.allocPrint(gen.allocator, "{} {}", .{gen.tag, gen.seq[gen.start..gen.start+1]});
-            gen.start += 1;
-
-            return res;
+    fn dump(self: *Differ, tag: []const u8, seq: []const []const u8, start: usize, end: usize) !void {
+        var i: usize = start;
+        while (i < end) : (i += 1) {
+            var res = try fmt.allocPrint(self.allocator, "{} {}", .{ tag, seq[i] });
+            try self.diffs.append(res);
         }
-    };
+    }
+
+    fn fancyReplace(self: *Differ, a: []const []const u8, b: []const []const u8, a_start: usize, a_end: usize, b_start: usize, b_end: usize) SetSeq2ErrorSet!void {
+        var best_ratio: f32 = 0.74;
+        var cutoff: f32 = 0.75;
+        var best_i: usize = undefined;
+        var best_j: usize = undefined;
+
+        var sm = SequenceMatcher([]const u8).init(self.allocator);
+        defer sm.deinit();
+
+        var eqi: ?usize = null;
+        var eqj: ?usize = null;
+
+        var j: usize = b_start;
+        while (j < b_end) : (j += 1) {
+            var bj = b[j];
+            try sm.setSeq2(bj);
+
+            var i: usize = a_start;
+            while (i < a_end) : (i += 1) {
+                var ai = a[i];
+                if (mem.eql(u8, ai, bj)) {
+                    if (eqi == null) {
+                        eqi = i;
+                        eqj = j;
+                    }
+                    continue;
+                }
+                sm.setSeq1(ai);
+                if (sm.realQuickRatio() > best_ratio and try sm.quickRatio() > best_ratio and try sm.ratio() > best_ratio) {
+                    best_ratio = try sm.ratio();
+                    best_i = i;
+                    best_j = j;
+                }
+            }
+        }
+
+        if (best_ratio < cutoff) {
+            if (eqi) |e| {
+                best_i = e;
+                best_j = eqj.?;
+                best_ratio = 1.0;
+            } else {
+                try self.plainReplace(a, b, a_start, a_end, b_start, b_end);
+                return;
+            }
+        } else {
+            eqi = null;
+        }
+
+
+        if (a_start < best_i) {
+            if (b_start < best_j) {
+                try self.fancyReplace(a, b, a_start, best_i, b_start, best_j);
+            } else {
+                try self.dump("-", a, a_start, best_i);
+            }
+        } else if (b_start < best_j) {
+            try self.dump("+", b, b_start, best_j);
+        }
+
+        var a_el = a[best_i];
+        var b_el = b[best_j];
+        if (eqi) |_| {
+            var res = try fmt.allocPrint(self.allocator, "  {}", .{a_el});
+            try self.diffs.append(res);
+        } else {
+            var a_tags = ArrayList(u8).init(self.allocator);
+            var b_tags = ArrayList(u8).init(self.allocator);
+            defer {
+                a_tags.deinit();
+                b_tags.deinit();
+            }
+            try sm.setSeqs(a_el, b_el);
+            var opcodes = try sm.getOpcodes();
+            for (opcodes) |opcode| {
+                var la: usize = opcode.a_end - opcode.a_start;
+                var lb: usize = opcode.b_end - opcode.b_start;
+                switch (opcode.tag) {
+                    OpcodeTag.Replace => {
+                        var idx: usize = 0;
+                        while (idx < la) : (idx += 1) {
+                            try a_tags.append('^');
+                        }
+                        idx = 0;
+                        while (idx < lb) : (idx += 1) {
+                            try b_tags.append('^');
+                        }
+                    },
+                    OpcodeTag.Delete => {
+                        var idx: usize = 0;
+                        while (idx < la) : (idx += 1) {
+                            try a_tags.append('-');
+                        }
+                    },
+                    OpcodeTag.Insert => {
+                        var idx: usize = 0;
+                        while (idx < lb) : (idx += 1) {
+                            try b_tags.append('+');
+                        }
+                    },
+                    OpcodeTag.Equal => {
+                        var idx: usize = 0;
+                        while (idx < la) : (idx += 1) {
+                            try a_tags.append(' ');
+                        }
+                        idx = 0;
+                        while (idx < lb) : (idx += 1) {
+                            try b_tags.append(' ');
+                        }
+                    },
+                }
+            }
+            try self.qformat(a_el, b_el, a_tags.items, b_tags.items);
+        }
+        if (best_i + 1 < a_end) {
+            if (best_j + 1 < b_end) {
+                try self.fancyReplace(a, b, best_i + 1, a_end, best_j + 1, b_end);
+            } else {
+                try self.dump("-", a, best_i + 1, a_end);
+            }
+        } else if (best_j + 1 < b_end) {
+            try self.dump("+", b, best_j + 1, b_end);
+        }
+    }
+
+    fn plainReplace(self: *Differ, a: []const []const u8, b: []const []const u8, a_start: usize, a_end: usize, b_start: usize, b_end: usize) !void {
+        assert(a_start < a_end and b_start < b_end);
+
+        if (b_end - b_start < a_end - a_start) {
+            try self.dump("+", b, b_start, b_end);
+            try self.dump("-", a, a_start, a_end);
+        } else {
+            try self.dump("-", a, a_start, a_end);
+            try self.dump("+", b, b_start, b_end);
+        }
+    }
+
+    fn qformat(self: *Differ, a_line: []const u8, b_line: []const u8, a_tags: []const u8, b_tags: []const u8) !void {
+        var clean_a_tags = try keepOriginalWhitespace(self.allocator, a_line, a_tags);
+        var clean_b_tags = try keepOriginalWhitespace(self.allocator, b_line, b_tags);
+        defer {
+            clean_a_tags.deinit();
+            clean_b_tags.deinit();
+        }
+
+        var al = try fmt.allocPrint(self.allocator, "- {}", .{a_line});
+        try self.diffs.append(al);
+
+        if (clean_a_tags.items.len > 0) {
+            var at = try fmt.allocPrint(self.allocator, "? {}\n", .{clean_a_tags.items});
+            try self.diffs.append(at);
+        }
+
+        var bl = try fmt.allocPrint(self.allocator, "+ {}", .{b_line});
+        try self.diffs.append(bl);
+
+        if (clean_b_tags.items.len > 0) {
+            var bt = try fmt.allocPrint(self.allocator, "? {}\n", .{clean_b_tags.items});
+            try self.diffs.append(bt);
+        }
+    }
 };
 
-fn collectLines(allocator: *mem.Allocator, it: var) !ArrayList([]u8) {
-    var output = ArrayList([]u8).init(allocator);
-    while (try it.next()) |item| {
-        try output.append(item);
+fn keepOriginalWhitespace(allocator: *mem.Allocator, str: []const u8, tag_str: []const u8) !ArrayList(u8) {
+    var out = ArrayList(u8).init(allocator);
+    for (str) |c, idx| {
+        if (idx >= tag_str.len) break;
+        var tag_c = tag_str[idx];
+        if (tag_c == ' ' and std.ascii.isSpace(c)) {
+            try out.append(c);
+        } else {
+            try out.append(tag_c);
+        }
     }
-    return output;
+    // remove right-hand side whitespace
+    var idx: usize = out.items.len - 1;
+    while (std.ascii.isSpace(out.items[idx])) {
+        if (idx == 0) break;
+        idx -= 1;
+    }
+    out.shrink(idx + 1);
+    return out;
 }
 
 test "compare" {
-    var differ = try Differ.init(testing.allocator);
+    // var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    // defer arena.deinit();
+    // const allocator = &arena.allocator;
+    const allocator = testing.allocator;
+
+    var differ = Differ.init(allocator);
     defer differ.deinit();
 
-    var it = try differ.compare("asdf\nfdsa\n", "asxdf\na\n");
-    while (try it.next()) |diff_line| {
-        std.debug.warn("\n{}", .{diff_line});
-        testing.allocator.free(diff_line);
-    }
+    const a = [_][]const u8{
+        "one\n",
+        "two\n",
+        "three\n",
+    };
+    const b = [_][]const u8{
+        "ore\n",
+        "tree\n",
+        "emu\n",
+    };
+
+    var diffs = try differ.compare(a[0..], b[0..]);
+    var diff = try std.mem.join(allocator, "", diffs);
+    std.debug.warn("\n{}", .{diff});
+    //     for (diffs) |diff_line| {
+    //         std.debug.warn("{}", .{diff_line});
+    //     }
     std.debug.warn("\n", .{});
+    allocator.free(diff);
 }

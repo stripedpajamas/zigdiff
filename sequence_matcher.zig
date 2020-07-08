@@ -398,7 +398,7 @@ pub fn SequenceMatcher(comptime T: type) type {
                     if (full_b_count.getValue(el)) |count| {
                         _ = try full_b_count.put(el, count + 1);
                     } else {
-                        _ = try full_b_count.put(el, 0);
+                        _ = try full_b_count.put(el, 1);
                     }
                 }
                 self.full_b_count = full_b_count;
@@ -407,15 +407,15 @@ pub fn SequenceMatcher(comptime T: type) type {
             var avail = SeqToCountMapType.init(self.allocator);
             defer avail.deinit();
             var matches: usize = 0;
-            for (self.seq2) |el| {
+            for (self.seq1) |el| {
+                var n: i32 = 0;
                 if (avail.getValue(el)) |a| {
-                    _ = try avail.put(el, a - 1);
+                    n = a;
                 } else {
-                    _ = try avail.put(el, full_b_count.getValue(el) orelse 0);
+                    n = full_b_count.getValue(el) orelse 0;
                 }
-                if (avail.getValue(el)) |a| {
-                    if (a > 0) matches += 1;
-                }
+                _ = try avail.put(el, n - 1);
+                if (n > 0) matches += 1;
             }
             return calculateRatio(matches, self.seq1.len + self.seq2.len);
         }
@@ -717,6 +717,16 @@ test "ratio" {
         var real_quick = sm.realQuickRatio();
         assert(std.math.approxEq(f32, actual, testCase.expected, 0.001));
     }
+}
+
+test "quick ratio" {
+    var sm = SequenceMatcher([]const u8).init(testing.allocator);
+    defer sm.deinit();
+
+    try sm.setSeqs("one\n", "ore\n");
+    var quick = try sm.quickRatio();
+
+    assert(quick == 0.75);
 }
 
 test "sequence matching of strings" {
