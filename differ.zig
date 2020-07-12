@@ -11,18 +11,31 @@ const ArrayList = std.ArrayList;
 
 const SetSeq2ErrorSet = @TypeOf(seq_matcher.SequenceMatcher([]const u8).setSeq2).ReturnType.ErrorSet;
 
+pub const LineDiff = struct {
+    from_line:    []const u8,
+    to_line: []const u8,
+    change: bool,
+};
+
+const LinesAndStarters = struct {
+    lines: []const []const u8,
+    starters: []const u8,
+};
+
 // Differ takes [][]const u8 lines of input (each should end with a \n)
 // and outputs lines of Diffs ([][]const u8).
 pub const Differ = struct {
     allocator: *mem.Allocator,
     sm: SequenceMatcher([]const []const u8),
     diffs: ArrayList([]u8),
+    diff_lines: ArrayList(LineDiff),
 
     pub fn init(allocator: *mem.Allocator) Differ {
         return Differ{
             .allocator = allocator,
             .sm = SequenceMatcher([]const []const u8).init(allocator),
             .diffs = ArrayList([]u8).init(allocator),
+            .diff_lines = ArrayList(LineDiff).init(allocator),
         };
     }
 
@@ -232,6 +245,110 @@ pub const Differ = struct {
             try self.diffs.append(bt);
         }
     }
+
+    fn getNextLines(self: *Differ, idx: usize) !LinesAndStarters {
+        assert(idx < self.diffs.items.len);
+        var lines = try ArrayList([]u8).initCapacity(self.allocator, 4);
+
+        var x = [_]u8{'X'};
+
+        var diffs = self.diffs.items;
+        var i = idx;
+        while (i < idx + 4) : (i += 1) {
+            if (i >= diffs.len) {
+                try lines.append(&x);
+            } else {
+                try lines.append(diffs[i]);
+            }
+        }
+
+        var starters = try ArrayList(u8).initCapacity(self.allocator, 4);
+        for (lines.items) |line| {
+            try starters.append(line[0]);
+        }
+
+        return LinesAndStarters{
+            .lines = lines.toOwnedSlice(),
+            .starters = starters.toOwnedSlice(),
+        };
+    }
+
+    fn getDiffLines(self: *Differ) !void {
+        assert(self.diffs.items.len > 0);
+
+        var blanks_pending: i32 = 0;
+        var blanks_ready: i32 = 0;
+
+        var diff_idx: usize = 0;
+        while (diff_idx < self.diffs.items.len) : (diff_idx += 4) {
+            var lines_and_starters = try self.getNextLines(diff_idx);
+            defer {
+                self.allocator.free(lines_and_starters.starters);
+                self.allocator.free(lines_and_starters.lines);
+            }
+            var s = lines_and_starters.starters;
+
+            if (mem.startsWith(u8, s, "X")) {
+                blanks_ready = blanks_pending;
+            } else if (mem.startsWith(u8, s, "-?+?")) {
+                // make line
+                continue;
+            } else if (mem.startsWith(u8, s, "--++")) {
+                blanks_pending -= 1;
+                // make line
+                continue;
+            } else if (mem.startsWith(u8, s, "--?+") or mem.startsWith(u8, s, "--+") or mem.startsWith(u8, s, "- ")) {
+                // make line
+                blanks_ready = blanks_pending - 1;
+                blanks_pending = 0;
+            } else if (mem.startsWith(u8, s, "-+?")) {
+                // make line
+                continue;
+            } else if (mem.startsWith(u8, s, "-?+")) {
+                // make line
+                continue;
+            } else if (mem.startsWith(u8, s, "-")) {
+                blanks_pending -= 1;
+                // make line
+                continue;
+            } else if (mem.startsWith(u8, s, "+--")) {
+                blanks_pending += 1;
+                // make line
+                continue;
+            } else if (mem.startsWith(u8, s, "+ ") or mem.startsWith(u8, s, "+-")) {
+                // make line
+                blanks_ready = blanks_pending + 1;
+                blanks_pending = 0;
+            } else if (mem.startsWith(u8, s, "+")) {
+                blanks_pending += 1;
+                // make line
+                continue;
+            } else if (mem.startsWith(u8, s, " ")) {
+                // make line
+                continue;
+            }
+
+            while (blanks_ready < 0) : (blanks_ready += 1) {
+                // yield something
+            }
+
+            while (blanks_pending > 0) : (blanks_pending -= 1) {
+                // yield something
+            }
+
+            if (mem.startsWith(u8, s, "X")) {
+                return; // return what?
+            } else {
+                // yield something
+            }
+
+        }
+    }
+
+    pub fn mdiff(self: *Differ, from_lines: []const []const u8, to_lines: []const []const u8) !void {
+        var diffs = try self.compare(from_lines, to_lines);
+        try self.getDiffLines();
+    }
 };
 
 fn keepOriginalWhitespace(allocator: *mem.Allocator, str: []const u8, tag_str: []const u8) !ArrayList(u8) {
@@ -253,6 +370,18 @@ fn keepOriginalWhitespace(allocator: *mem.Allocator, str: []const u8, tag_str: [
     out.items.len = idx;
     return out;
 }
+
+test "mdiff" {
+    var allocator = testing.allocator;
+
+    var differ = Differ.init(allocator);
+    defer differ.deinit();
+
+    const a = &[_][]const u8{ "one\n", "two\n", "three\n" };
+    const b = &[_][]const u8{ "ore\n", "tree\n", "emu\n" };
+    try differ.mdiff(a, b);
+}
+
 
 test "compare" {
     const TestCase = struct {
